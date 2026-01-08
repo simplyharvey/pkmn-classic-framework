@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Web;
@@ -11,6 +11,30 @@ namespace PkmnFoundations.GTS
 {
     public class Global : System.Web.HttpApplication
     {
+        // =====================================================
+        // RATE LIMITING - Added to prevent spam/flooding
+        // =====================================================
+        
+        // Storage for tracking requests per IP
+        private static Dictionary<string, List<DateTime>> _requestLog = 
+            new Dictionary<string, List<DateTime>>();
+        
+        // Storage for temporarily banned IPs
+        private static Dictionary<string, DateTime> _bannedIPs = 
+            new Dictionary<string, DateTime>();
+        
+        // Thread safety lock
+        private static readonly object _rateLimitLock = new object();
+        
+        // Configuration - adjust these values as needed
+        private const int MAX_REQUESTS_PER_MINUTE = 60;      // Normal rate limit
+        private const int BAN_THRESHOLD = 200;               // Requests that trigger temp ban
+        private const int BAN_DURATION_MINUTES = 15;         // How long temp ban lasts
+        
+        // =====================================================
+        // EXISTING CODE - Unchanged
+        // =====================================================
+
         void Application_Start(object sender, EventArgs e)
         {
             // Code that runs on application startup
@@ -46,6 +70,18 @@ namespace PkmnFoundations.GTS
 
         void Application_BeginRequest(object sender, EventArgs e)
         {
+            // =====================================================
+            // RATE LIMITING CHECK - Added for security
+            // =====================================================
+            if (!CheckRateLimit())
+            {
+                // Request rejected due to rate limiting
+                return;
+            }
+            
+            // =====================================================
+            // EXISTING URL REWRITE CODE - Unchanged
+            // =====================================================
             String pathInfo, query;
             String targetUrl = RewriteUrl(Request.Url.PathAndQuery, out pathInfo, out query);
 
@@ -60,6 +96,9 @@ namespace PkmnFoundations.GTS
             GamestatsSessionManager.FromContext(Context).PruneSessions();
         }
 
+        // =====================================================
+        // EXISTING URL REWRITE METHOD - Unchanged
+        // =====================================================
         public static String RewriteUrl(String url, out String pathInfo, out String query)
         {
             int q = url.IndexOf('?');
@@ -108,6 +147,157 @@ namespace PkmnFoundations.GTS
                 return VirtualPathUtility.ToAbsolute("~/pgl.ashx");
             }
             else return null;
+        }
+
+        // =====================================================
+        // RATE LIMITING METHODS - New security additions
+        // =====================================================
+
+        /// <summary>
+        /// Checks if the current request should be allowed based on rate limiting.
+        /// Returns true if request is allowed, false if rejected.
+        /// </summary>
+        private bool CheckRateLimit()
+        {
+            string ip = GetClientIP();
+            DateTime now = DateTime.UtcNow;
+
+            lock (_rateLimitLock)
+            {
+                // Check if IP is temporarily banned
+                if (_bannedIPs.ContainsKey(ip))
+                {
+                    if ((now - _bannedIPs[ip]).TotalMinutes < BAN_DURATION_MINUTES)
+                    {
+                        RejectRequest(429, "Too many requests. Please try again later.");
+                        return false;
+                    }
+                    else
+                    {
+                        // Ban expired, remove it
+                        _bannedIPs.Remove(ip);
+                    }
+                }
+
+                // Initialize request log for this IP if needed
+                if (!_requestLog.ContainsKey(ip))
+                {
+                    _requestLog[ip] = new List<DateTime>();
+                }
+
+                // Clean entries older than 1 minute
+                _requestLog[ip].RemoveAll(t => (now - t).TotalMinutes > 1);
+
+                // Check if over rate limit
+                if (_requestLog[ip].Count >= MAX_REQUESTS_PER_MINUTE)
+                {
+                    // If way over limit, add to temp ban list
+                    if (_requestLog[ip].Count >= BAN_THRESHOLD)
+                    {
+                        _bannedIPs[ip] = now;
+                        LogSecurityEvent(ip, "TEMP_BANNED", _requestLog[ip].Count);
+                    }
+
+                    RejectRequest(429, "Rate limit exceeded. Please slow down.");
+                    return false;
+                }
+
+                // Log this request
+                _requestLog[ip].Add(now);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Gets the client IP address, accounting for proxies/load balancers.
+        /// </summary>
+        private string GetClientIP()
+        {
+            string ip = null;
+
+            // Check for forwarded IP (if behind proxy/load balancer)
+            string forwardedFor = Request.ServerVariables["HTTP_X_FORWARDED_FOR"];
+            if (!string.IsNullOrEmpty(forwardedFor))
+            {
+                // X-Forwarded-For can contain multiple IPs; take the first (original client)
+                ip = forwardedFor.Split(',')[0].Trim();
+            }
+
+            // Fall back to direct remote address
+            if (string.IsNullOrEmpty(ip))
+            {
+                ip = Request.ServerVariables["REMOTE_ADDR"];
+            }
+
+            return ip ?? "unknown";
+        }
+
+        /// <summary>
+        /// Rejects a request with the specified status code and message.
+        /// </summary>
+        private void RejectRequest(int statusCode, string message)
+        {
+            Response.Clear();
+            Response.StatusCode = statusCode;
+            Response.StatusDescription = "Too Many Requests";
+            Response.ContentType = "text/plain";
+            Response.Write(message);
+            Response.End();
+        }
+
+        /// <summary>
+        /// Logs security events (optional - implement based on your logging setup).
+        /// </summary>
+        private void LogSecurityEvent(string ip, string eventType, int requestCount)
+        {
+            // TODO: Implement logging to your preferred system
+            // Examples:
+            // - Write to Windows Event Log
+            // - Write to database
+            // - Write to log file
+            // 
+            // For now, this just writes to debug output
+            System.Diagnostics.Debug.WriteLine(
+                $"[SECURITY] {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} | {eventType} | IP: {ip} | Requests: {requestCount}"
+            );
+        }
+
+        /// <summary>
+        /// Periodic cleanup of old rate limit entries to prevent memory growth.
+        /// Call this from a scheduled task or timer if needed.
+        /// </summary>
+        public static void CleanupRateLimitData()
+        {
+            DateTime now = DateTime.UtcNow;
+            
+            lock (_rateLimitLock)
+            {
+                // Clean up old request logs
+                var ipsToClear = new List<string>();
+                foreach (var kvp in _requestLog)
+                {
+                    kvp.Value.RemoveAll(t => (now - t).TotalMinutes > 5);
+                    if (kvp.Value.Count == 0)
+                    {
+                        ipsToClear.Add(kvp.Key);
+                    }
+                }
+                foreach (var ip in ipsToClear)
+                {
+                    _requestLog.Remove(ip);
+                }
+
+                // Clean up expired bans
+                var bansToRemove = _bannedIPs
+                    .Where(kvp => (now - kvp.Value).TotalMinutes >= BAN_DURATION_MINUTES)
+                    .Select(kvp => kvp.Key)
+                    .ToList();
+                foreach (var ip in bansToRemove)
+                {
+                    _bannedIPs.Remove(ip);
+                }
+            }
         }
     }
 }
