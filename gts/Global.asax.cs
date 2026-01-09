@@ -26,25 +26,41 @@ namespace PkmnFoundations.GTS
         // Thread safety lock
         private static readonly object _rateLimitLock = new object();
         
+        // Cleanup timer
+        private static System.Threading.Timer _cleanupTimer;
+        
         // Configuration - adjust these values as needed
         private const int MAX_REQUESTS_PER_MINUTE = 60;      // Normal rate limit
-        private const int BAN_THRESHOLD = 200;               // Requests that trigger temp ban
+        private const int BAN_THRESHOLD = 100;               // Requests in window that trigger temp ban
         private const int BAN_DURATION_MINUTES = 15;         // How long temp ban lasts
         
         // =====================================================
-        // EXISTING CODE - Unchanged
+        // EXISTING CODE - Unchanged (except Application_Start)
         // =====================================================
 
         void Application_Start(object sender, EventArgs e)
         {
             // Code that runs on application startup
             AppStateHelper.Pokedex(Application);
+            
+            // Start cleanup timer - runs every 5 minutes
+            _cleanupTimer = new System.Threading.Timer(
+                _ => CleanupRateLimitData(),
+                null,
+                TimeSpan.FromMinutes(5),
+                TimeSpan.FromMinutes(5));
         }
 
         void Application_End(object sender, EventArgs e)
         {
             //  Code that runs on application shutdown
-
+            
+            // Dispose cleanup timer
+            if (_cleanupTimer != null)
+            {
+                _cleanupTimer.Dispose();
+                _cleanupTimer = null;
+            }
         }
 
         void Application_Error(object sender, EventArgs e)
@@ -97,7 +113,7 @@ namespace PkmnFoundations.GTS
         }
 
         // =====================================================
-        // EXISTING URL REWRITE METHOD - Unchanged
+        // EXISTING URL REWRITE METHOD - With bug fix for split.Length checks
         // =====================================================
         public static String RewriteUrl(String url, out String pathInfo, out String query)
         {
@@ -136,12 +152,14 @@ namespace PkmnFoundations.GTS
                 pathInfo = "/" + String.Join("/", split, 3, split.Length - 3);
                 return VirtualPathUtility.ToAbsolute("~/syachi2ds.ashx");
             }
-            else if (split.Length > 1 && split[1] == "pokemon" && split[2] == "validate")
+            // BUG FIX: Changed split.Length > 1 to split.Length > 2 (was accessing split[2])
+            else if (split.Length > 2 && split[1] == "pokemon" && split[2] == "validate")
             {
                 pathInfo = "/pokemon/validate";
                 return VirtualPathUtility.ToAbsolute("~/pkvldtprod.ashx");
             }
-            else if (split.Length > 1 && split[1] == "dsio" && split[2] == "gw")
+            // BUG FIX: Changed split.Length > 1 to split.Length > 2 (was accessing split[2])
+            else if (split.Length > 2 && split[1] == "dsio" && split[2] == "gw")
             {
                 pathInfo = "/dsio/gw";
                 return VirtualPathUtility.ToAbsolute("~/pgl.ashx");
@@ -160,6 +178,13 @@ namespace PkmnFoundations.GTS
         private bool CheckRateLimit()
         {
             string ip = GetClientIP();
+            
+            // Skip rate limiting if we couldn't determine IP
+            if (ip == null)
+            {
+                return true;
+            }
+            
             DateTime now = DateTime.UtcNow;
 
             lock (_rateLimitLock)
@@ -185,11 +210,14 @@ namespace PkmnFoundations.GTS
                     _requestLog[ip] = new List<DateTime>();
                 }
 
+                // Add current request BEFORE checking (so ban threshold can be reached)
+                _requestLog[ip].Add(now);
+                
                 // Clean entries older than 1 minute
                 _requestLog[ip].RemoveAll(t => (now - t).TotalMinutes > 1);
 
                 // Check if over rate limit
-                if (_requestLog[ip].Count >= MAX_REQUESTS_PER_MINUTE)
+                if (_requestLog[ip].Count > MAX_REQUESTS_PER_MINUTE)
                 {
                     // If way over limit, add to temp ban list
                     if (_requestLog[ip].Count >= BAN_THRESHOLD)
@@ -201,9 +229,6 @@ namespace PkmnFoundations.GTS
                     RejectRequest(429, "Rate limit exceeded. Please slow down.");
                     return false;
                 }
-
-                // Log this request
-                _requestLog[ip].Add(now);
             }
 
             return true;
@@ -211,6 +236,7 @@ namespace PkmnFoundations.GTS
 
         /// <summary>
         /// Gets the client IP address, accounting for proxies/load balancers.
+        /// Returns null if IP cannot be determined (to avoid grouping unknowns).
         /// </summary>
         private string GetClientIP()
         {
@@ -230,20 +256,27 @@ namespace PkmnFoundations.GTS
                 ip = Request.ServerVariables["REMOTE_ADDR"];
             }
 
-            return ip ?? "unknown";
+            // Return null instead of "unknown" to avoid grouping all unknowns together
+            return string.IsNullOrEmpty(ip) ? null : ip;
         }
 
         /// <summary>
         /// Rejects a request with the specified status code and message.
+        /// Uses CompleteRequest() instead of Response.End() to avoid ThreadAbortException.
         /// </summary>
         private void RejectRequest(int statusCode, string message)
         {
-            Response.Clear();
-            Response.StatusCode = statusCode;
-            Response.StatusDescription = "Too Many Requests";
-            Response.ContentType = "text/plain";
-            Response.Write(message);
-            Response.End();
+            var context = HttpContext.Current;
+            var response = context.Response;
+
+            response.Clear();
+            response.StatusCode = statusCode;
+            response.StatusDescription = "Too Many Requests";
+            response.ContentType = "text/plain";
+            response.Write(message);
+
+            // Gracefully short-circuit the pipeline (avoids ThreadAbortException)
+            context.ApplicationInstance.CompleteRequest();
         }
 
         /// <summary>
@@ -265,7 +298,7 @@ namespace PkmnFoundations.GTS
 
         /// <summary>
         /// Periodic cleanup of old rate limit entries to prevent memory growth.
-        /// Call this from a scheduled task or timer if needed.
+        /// Called automatically by timer started in Application_Start.
         /// </summary>
         public static void CleanupRateLimitData()
         {
@@ -301,3 +334,19 @@ namespace PkmnFoundations.GTS
         }
     }
 }
+```
+
+---
+
+**For the commit message:**
+
+Title: `Fix rate limiting bugs and add cleanup timer`
+
+Extended description:
+```
+v2 improvements based on code review:
+- Fixed BAN_THRESHOLD logic (was unreachable)
+- Switched Response.End() to CompleteRequest() (avoids ThreadAbortException)
+- Added automatic cleanup timer for memory management
+- Fixed split.Length bug in existing RewriteUrl method
+- Return null instead of "unknown" for undetectable IPs
